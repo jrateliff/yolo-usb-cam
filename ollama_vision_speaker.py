@@ -1,4 +1,26 @@
 #!/usr/bin/env python3
+# =============================================================================
+# Git Commit Instructions (for this project)
+# -----------------------------------------------------------------------------
+# 1. Stage changes:
+#       git add ollama_vision_speaker.py
+#
+# 2. Commit with a clear message:
+#       git commit -m "Update ollama_vision_speaker.py: <short description>"
+#
+# 3. Push to GitHub (main branch):
+#       git push
+#
+# Notes:
+# - Your Git identity is set as:
+#       user.name  = jrateliff
+#       user.email = jtrdevgit@gmail.com
+# - Remote origin is set to SSH:
+#       git@github.com:jrateliff/yolo-usb-cam.git
+# - VS Code Source Control panel can also do stage/commit/push.
+# =============================================================================
+
+
 """
 ollama_vision_speaker.py
 Realtime camera captions using OpenCV + a local Ollama vision model (default: moondream),
@@ -339,3 +361,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+    # This is a test commit to ensure the script runs without errors.
