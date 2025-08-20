@@ -11,7 +11,7 @@
 # From Terminal:
 #   cd ~/yolo-usb-cam
 #   git add ollama_vision_speaker_async.py
-#   git commit -m "Add async, throttled Ollama captioner (reduced power/latency)"
+#   git commit -m "Async captioner: overlay-only (no terminal output), no power-mode changes"
 #   git push
 #
 # Notes:
@@ -20,11 +20,12 @@
 # =============================================================================
 """
 ollama_vision_speaker_async.py
-Async, low-chatter, low-power captioner:
+Async, low-chatter, overlay-only captioner:
   • Camera loop never blocks on network or TTS.
-  • Background worker pulls only the latest frame (no backlog).
+  • Background worker uses only the latest frame (no backlog).
   • Speak throttle + redundancy filter (skip near-duplicates).
-  • Lower default FPS, resize, and JPEG Q to cut power spikes.
+  • Overlay text onto the preview window; NO terminal prints by default.
+  • Program does NOT change Jetson power mode (no nvpmodel calls).
 
 Prereqs:
   pip install "numpy<2" "opencv-python-headless<4.9" requests
@@ -48,12 +49,13 @@ import requests
 
 # --------------------------- Utils ---------------------------
 
-def bgr_to_jpeg_b64(img_bgr: np.ndarray, quality: int = 70) -> str:
+def bgr_to_jpeg_b64(img_bgr: np.ndarray, quality: int = 68) -> str:
     """Encode BGR frame to base64 JPEG string (no data URI)."""
     encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), int(np.clip(quality, 50, 95))]
     ok, buf = cv2.imencode(".jpg", img_bgr, encode_params)
     if not ok:
-        raise RuntimeError("JPEG encode failed.")
+        # No prints: fail silently by returning empty payload
+        return ""
     return base64.b64encode(buf.tobytes()).decode("ascii")
 
 
@@ -106,6 +108,7 @@ def speak_espeak(text: str, wpm: int = 160, voice: str = "en-us", gap_ms: int = 
             check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
     except FileNotFoundError:
+        # Stay silent in terminal
         pass
 
 
@@ -123,6 +126,8 @@ class OllamaClient:
         self.sess = requests.Session()
 
     def describe_image(self, img_b64_jpeg: str, prompt: str, system: Optional[str] = None) -> str:
+        if not img_b64_jpeg:
+            return ""
         # Try /api/chat (preferred)
         try:
             payload = {
@@ -143,14 +148,17 @@ class OllamaClient:
         except Exception:
             pass
         # Fallback /api/generate
-        payload = {"model": self.model, "prompt": prompt, "images": [img_b64_jpeg], "stream": False}
-        r = self.sess.post(f"{self.base_url}/api/generate", json=payload, timeout=self.timeout)
-        r.raise_for_status()
-        data = r.json()
-        resp = data.get("response", "")
-        if resp.strip():
-            return resp.strip()
-        raise RuntimeError("Empty response from Ollama.")
+        try:
+            payload = {"model": self.model, "prompt": prompt, "images": [img_b64_jpeg], "stream": False}
+            r = self.sess.post(f"{self.base_url}/api/generate", json=payload, timeout=self.timeout)
+            r.raise_for_status()
+            data = r.json()
+            resp = data.get("response", "")
+            if resp.strip():
+                return resp.strip()
+        except Exception:
+            pass
+        return ""  # No terminal prints
 
 
 # --------------------------- Workers ---------------------------
@@ -162,7 +170,8 @@ class CaptionWorker(threading.Thread):
     """
     def __init__(self, client: OllamaClient, prompt: str, system: Optional[str],
                  frame_q: queue.Queue, caption_q: queue.Queue,
-                 describe_period: float, max_resize_width: int, jpeg_quality: int):
+                 describe_period: float, max_resize_width: int, jpeg_quality: int,
+                 enable_log: bool = False):
         super().__init__(daemon=True)
         self.client = client
         self.prompt = prompt
@@ -173,14 +182,22 @@ class CaptionWorker(threading.Thread):
         self.max_resize_width = int(max(320, max_resize_width))
         self.jpeg_quality = int(np.clip(jpeg_quality, 50, 95))
         self._stop = threading.Event()
+        self.enable_log = enable_log  # if True, will print minimal logs
 
     def stop(self):
         self._stop.set()
 
+    def _log(self, msg: str):
+        if self.enable_log:
+            # Optional: minimal logging if --log is passed
+            try:
+                print(msg)
+            except Exception:
+                pass
+
     def run(self):
         next_time = time.monotonic()
         while not self._stop.is_set():
-            # Pace requests
             now = time.monotonic()
             if now < next_time:
                 time.sleep(min(0.01, next_time - now))
@@ -192,7 +209,6 @@ class CaptionWorker(threading.Thread):
             try:
                 while True:
                     frame = self.frame_q.get(timeout=0.2)
-                    # Empty the queue to get the newest
                     while not self.frame_q.empty():
                         frame = self.frame_q.get_nowait()
                     break
@@ -218,9 +234,10 @@ class CaptionWorker(threading.Thread):
                                 _ = self.caption_q.get_nowait()
                             except queue.Empty:
                                 pass
-                    print(f"[{time.strftime('%H:%M:%S')}] {cleaned}")
-            except Exception as e:
-                print(f"Ollama request error: {e}")
+                    self._log(f"[{time.strftime('%H:%M:%S')}] {cleaned}")
+            except Exception:
+                # Silent by default
+                pass
 
 
 class TTSWorker(threading.Thread):
@@ -264,7 +281,7 @@ class TTSWorker(threading.Thread):
 # --------------------------- Main ---------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="Async, throttled Ollama vision speaker")
+    ap = argparse.ArgumentParser(description="Async, throttled Ollama vision speaker (overlay-only)")
     # Capture / pacing
     ap.add_argument("--camera", type=int, default=0)
     ap.add_argument("--width", type=int, default=640)
@@ -295,6 +312,7 @@ def main():
     # Misc
     ap.add_argument("--title", type=str, default="Ollama Vision Speaker (Async)")
     ap.add_argument("--timeout", type=float, default=60.0)
+    ap.add_argument("--log", action="store_true", help="Enable minimal terminal logs (off by default).")
     args = ap.parse_args()
 
     # Camera
@@ -303,6 +321,7 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(args.height))
     cap.set(cv2.CAP_PROP_FPS, float(args.fps))
     if not cap.isOpened():
+        # No prints: raise to exit quietly; caller sees no logs
         raise RuntimeError(f"Camera {args.camera} failed to open.")
 
     # Queues
@@ -314,7 +333,8 @@ def main():
     cap_worker = CaptionWorker(client, args.prompt, args.system, frame_q, caption_q,
                                describe_period=args.describe,
                                max_resize_width=args.max_resize_width,
-                               jpeg_quality=args.jpeg_quality)
+                               jpeg_quality=args.jpeg_quality,
+                               enable_log=args.log)
     tts = TTSWorker(args.speak, args.wpm, args.voice, args.gap, args.pitch)
     cap_worker.start()
     tts.start()
@@ -346,7 +366,6 @@ def main():
 
             # Offer latest frame to worker (drop older)
             try:
-                # If full, drop the pending older frame to keep only the newest
                 if frame_q.full():
                     try:
                         _ = frame_q.get_nowait()
@@ -354,13 +373,12 @@ def main():
                         pass
                 frame_q.put_nowait(frame)
             except queue.Full:
-                pass  # shouldn't happen due to drop logic
+                pass
 
             # Pull newest caption if available
             try:
                 while True:
                     last_caption = caption_q.get_nowait()
-                    # drain to keep only the newest
                     if caption_q.empty():
                         break
             except queue.Empty:
