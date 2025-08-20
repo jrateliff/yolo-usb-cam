@@ -10,8 +10,8 @@
 #
 # From Terminal:
 #   cd ~/yolo-usb-cam
-#   git add ollama_vision_speaker.py
-#   git commit -m "Update ollama_vision_speaker.py: <short description>"
+#   git add ollama_vision_speaker_async.py
+#   git commit -m "Add async, throttled Ollama captioner (reduced power/latency)"
 #   git push
 #
 # Notes:
@@ -19,40 +19,37 @@
 # - Identity: user.name = jrateliff, user.email = jtrdevgit@gmail.com
 # =============================================================================
 """
-ollama_vision_speaker.py
-Realtime camera captions using OpenCV + a local Ollama vision model (default: moondream),
-with optional spoken output via espeak-ng. Prints captions to the terminal and can show
-a preview window with overlays.
+ollama_vision_speaker_async.py
+Async, low-chatter, low-power captioner:
+  • Camera loop never blocks on network or TTS.
+  • Background worker pulls only the latest frame (no backlog).
+  • Speak throttle + redundancy filter (skip near-duplicates).
+  • Lower default FPS, resize, and JPEG Q to cut power spikes.
 
-This version adds:
-  • Speak throttling: don't talk too often (--min-speak-interval)
-  • Redundancy filter: only speak if caption changed enough (--min-change)
-  • Natural pacing: word gap/pitch/rate controls for espeak-ng
-  • Lower default bandwidth for less latency/power (smaller resize + jpeg quality)
+Prereqs:
+  pip install "numpy<2" "opencv-python-headless<4.9" requests
+  sudo apt install espeak-ng
 """
 
 import argparse
 import base64
-import json
-import os
+import difflib
 import queue
 import subprocess
 import textwrap
 import threading
 import time
-from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 
 import cv2
 import numpy as np
 import requests
-import difflib
 
 
-# --------------------------- Utility ---------------------------
+# --------------------------- Utils ---------------------------
 
-def bgr_to_jpeg_b64(img_bgr: np.ndarray, quality: int = 75) -> str:
-    """Encode a BGR image to base64 JPEG string without data URI prefix."""
+def bgr_to_jpeg_b64(img_bgr: np.ndarray, quality: int = 70) -> str:
+    """Encode BGR frame to base64 JPEG string (no data URI)."""
     encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), int(np.clip(quality, 50, 95))]
     ok, buf = cv2.imencode(".jpg", img_bgr, encode_params)
     if not ok:
@@ -60,14 +57,20 @@ def bgr_to_jpeg_b64(img_bgr: np.ndarray, quality: int = 75) -> str:
     return base64.b64encode(buf.tobytes()).decode("ascii")
 
 
-def overlay_caption(frame: np.ndarray, caption: str, max_width_frac: float = 0.9) -> np.ndarray:
-    """Draw a semi-transparent caption box with wrapped text at the bottom of the frame."""
+def resize_if_needed(img: np.ndarray, max_width: int) -> np.ndarray:
+    if img.shape[1] <= max_width:
+        return img
+    scale = max_width / img.shape[1]
+    nh = int(img.shape[0] * scale)
+    return cv2.resize(img, (max_width, nh), interpolation=cv2.INTER_AREA)
+
+
+def overlay_caption(frame: np.ndarray, caption: str, max_width_frac: float = 0.95) -> np.ndarray:
     if not caption:
         return frame
-
     h, w = frame.shape[:2]
     margin = 10
-    approx_char_w = 12  # heuristic for cv2.putText (FONT_HERSHEY_SIMPLEX, 0.6)
+    approx_char_w = 12
     max_chars = max(20, int((w * max_width_frac - 2 * margin) // approx_char_w))
     lines = textwrap.wrap(caption.strip(), width=max_chars)
 
@@ -84,43 +87,29 @@ def overlay_caption(frame: np.ndarray, caption: str, max_width_frac: float = 0.9
 
     overlay = frame.copy()
     cv2.rectangle(overlay, (x1, y1), (x2, y2), (30, 30, 30), -1)
-    alpha = 0.55
-    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+    cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
     cv2.rectangle(frame, (x1, y1), (x2, y2), (200, 200, 200), 1)
 
     y = y1 + margin + 14
     for ln in lines:
         cv2.putText(frame, ln, (x1 + margin, y), font, scale, (240, 240, 240), thickness, cv2.LINE_AA)
         y += line_h
-
     return frame
 
 
-def speak_espeak(text: str, wpm: int = 175, voice: str = "en-us", gap_ms: int = 10, pitch: int = 50) -> None:
-    """
-    Speak using espeak-ng. gap_ms sets inter-word gap; pitch ~0..99.
-    Run this in a worker thread (blocking).
-    """
+def speak_espeak(text: str, wpm: int = 160, voice: str = "en-us", gap_ms: int = 30, pitch: int = 48) -> None:
     if not text:
         return
     try:
         subprocess.run(
-            ["espeak-ng",
-             "-s", str(int(wpm)),
-             "-v", voice,
-             "-g", str(int(gap_ms)),
-             "-p", str(int(pitch)),
-             text],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            ["espeak-ng", "-s", str(int(wpm)), "-v", voice, "-g", str(int(gap_ms)), "-p", str(int(pitch)), text],
+            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
     except FileNotFoundError:
-        pass  # espeak-ng not installed — ignore
+        pass
 
 
 def similarity(a: str, b: str) -> float:
-    """Return a 0..1 similarity score using difflib."""
     return difflib.SequenceMatcher(None, a.strip(), b.strip()).ratio() if a and b else 0.0
 
 
@@ -133,92 +122,127 @@ class OllamaClient:
         self.timeout = timeout
         self.sess = requests.Session()
 
-    def describe_image(
-        self,
-        img_b64_jpeg: str,
-        prompt: str,
-        system: Optional[str] = None,
-        stream: bool = False
-    ) -> str:
-        """
-        Try /api/chat first (preferred for multimodal), fall back to /api/generate if needed.
-        Returns the text content or raises RuntimeError on failure.
-        """
-        # 1) Try /api/chat
+    def describe_image(self, img_b64_jpeg: str, prompt: str, system: Optional[str] = None) -> str:
+        # Try /api/chat (preferred)
         try:
             payload = {
                 "model": self.model,
-                "stream": bool(stream),
+                "stream": False,
                 "messages": [
                     *([{"role": "system", "content": system}] if system else []),
-                    {
-                        "role": "user",
-                        "content": prompt,
-                        "images": [img_b64_jpeg],  # raw base64 (no prefix)
-                    },
+                    {"role": "user", "content": prompt, "images": [img_b64_jpeg]},
                 ],
             }
             r = self.sess.post(f"{self.base_url}/api/chat", json=payload, timeout=self.timeout)
             r.raise_for_status()
             data = r.json()
-            if isinstance(data, dict):
-                msg = data.get("message") or {}
-                content = msg.get("content") or ""
-                if content.strip():
-                    return content.strip()
+            msg = data.get("message") or {}
+            content = msg.get("content") or ""
+            if content.strip():
+                return content.strip()
         except Exception:
             pass
-
-        # 2) Fallback: /api/generate
-        try:
-            payload = {
-                "model": self.model,
-                "prompt": prompt,
-                "images": [img_b64_jpeg],
-                "stream": False,
-            }
-            r = self.sess.post(f"{self.base_url}/api/generate", json=payload, timeout=self.timeout)
-            r.raise_for_status()
-            data = r.json()
-            text = data.get("response", "")
-            if text.strip():
-                return text.strip()
-            raise RuntimeError("Empty response from /api/generate.")
-        except Exception as e:
-            raise RuntimeError(f"Ollama request failed: {e}")
+        # Fallback /api/generate
+        payload = {"model": self.model, "prompt": prompt, "images": [img_b64_jpeg], "stream": False}
+        r = self.sess.post(f"{self.base_url}/api/generate", json=payload, timeout=self.timeout)
+        r.raise_for_status()
+        data = r.json()
+        resp = data.get("response", "")
+        if resp.strip():
+            return resp.strip()
+        raise RuntimeError("Empty response from Ollama.")
 
 
-# --------------------------- Worker threads ---------------------------
+# --------------------------- Workers ---------------------------
+
+class CaptionWorker(threading.Thread):
+    """
+    Pulls the latest frame from frame_q (maxsize=1), rate-limited by describe_period.
+    Emits cleaned captions on caption_q (maxsize=1), replacing older.
+    """
+    def __init__(self, client: OllamaClient, prompt: str, system: Optional[str],
+                 frame_q: queue.Queue, caption_q: queue.Queue,
+                 describe_period: float, max_resize_width: int, jpeg_quality: int):
+        super().__init__(daemon=True)
+        self.client = client
+        self.prompt = prompt
+        self.system = system
+        self.frame_q = frame_q
+        self.caption_q = caption_q
+        self.describe_period = max(0.25, float(describe_period))
+        self.max_resize_width = int(max(320, max_resize_width))
+        self.jpeg_quality = int(np.clip(jpeg_quality, 50, 95))
+        self._stop = threading.Event()
+
+    def stop(self):
+        self._stop.set()
+
+    def run(self):
+        next_time = time.monotonic()
+        while not self._stop.is_set():
+            # Pace requests
+            now = time.monotonic()
+            if now < next_time:
+                time.sleep(min(0.01, next_time - now))
+                continue
+            next_time = now + self.describe_period
+
+            # Always use the *latest* frame (drop older)
+            frame = None
+            try:
+                while True:
+                    frame = self.frame_q.get(timeout=0.2)
+                    # Empty the queue to get the newest
+                    while not self.frame_q.empty():
+                        frame = self.frame_q.get_nowait()
+                    break
+            except queue.Empty:
+                continue
+            if frame is None:
+                continue
+
+            try:
+                frame_small = resize_if_needed(frame, self.max_resize_width)
+                b64 = bgr_to_jpeg_b64(frame_small, self.jpeg_quality)
+                text = self.client.describe_image(b64, self.prompt, self.system)
+                cleaned = " ".join(text.strip().split())
+                if cleaned:
+                    # Replace any pending caption with the newest
+                    put_ok = False
+                    while not put_ok:
+                        try:
+                            self.caption_q.put_nowait(cleaned)
+                            put_ok = True
+                        except queue.Full:
+                            try:
+                                _ = self.caption_q.get_nowait()
+                            except queue.Empty:
+                                pass
+                    print(f"[{time.strftime('%H:%M:%S')}] {cleaned}")
+            except Exception as e:
+                print(f"Ollama request error: {e}")
+
 
 class TTSWorker(threading.Thread):
-    """Speak strings without overlapping, with a 1-item queue (latest wins)."""
-    def __init__(self, enabled: bool, wpm: int = 170, voice: str = "en-us", gap_ms: int = 10, pitch: int = 50):
+    """Single-slot queue; latest utterance replaces older to avoid overlap/backlog."""
+    def __init__(self, enabled: bool, wpm: int, voice: str, gap_ms: int, pitch: int):
         super().__init__(daemon=True)
         self.enabled = enabled
         self.wpm = wpm
         self.voice = voice
         self.gap_ms = gap_ms
         self.pitch = pitch
-        self.q = queue.Queue(maxsize=1)  # 1 item: newest replaces older
+        self.q = queue.Queue(maxsize=1)
         self._stop = threading.Event()
 
-    def run(self):
-        while not self._stop.is_set():
-            try:
-                text = self.q.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            if not self.enabled:
-                continue
-            speak_espeak(text, wpm=self.wpm, voice=self.voice, gap_ms=self.gap_ms, pitch=self.pitch)
+    def stop(self):
+        self._stop.set()
 
     def say_replace(self, text: str):
-        """Replace any pending utterance with this one."""
         if not text:
             return
         while True:
             try:
-                # If full, drop the pending one
                 self.q.put_nowait(text)
                 break
             except queue.Full:
@@ -227,68 +251,82 @@ class TTSWorker(threading.Thread):
                 except queue.Empty:
                     pass
 
-    def stop(self):
-        self._stop.set()
+    def run(self):
+        while not self._stop.is_set():
+            try:
+                text = self.q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if self.enabled:
+                speak_espeak(text, self.wpm, self.voice, self.gap_ms, self.pitch)
 
 
-# --------------------------- Main app ---------------------------
+# --------------------------- Main ---------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Realtime camera captions using Ollama.")
-    parser.add_argument("--camera", type=int, default=0, help="Camera index (default 0).")
-    parser.add_argument("--width", type=int, default=640, help="Capture width.")
-    parser.add_argument("--height", type=int, default=480, help="Capture height.")
-    parser.add_argument("--fps", type=float, default=24.0, help="Capture FPS hint (lower saves power).")
-    parser.add_argument("--describe", type=float, default=3.5,
-                        help="Seconds between caption requests.")
-    parser.add_argument("--ollama-url", type=str, default="http://127.0.0.1:11434",
-                        help="Base URL for Ollama.")
-    parser.add_argument("--ollama-model", type=str, default="moondream",
-                        help="Ollama model name, e.g., 'moondream' or 'llava:7b'.")
-    parser.add_argument("--prompt", type=str, default="Describe the scene briefly.",
-                        help="Prompt sent with each frame.")
-    parser.add_argument("--system", type=str, default=None,
-                        help="Optional system message to steer the model.")
-    parser.add_argument("--jpeg-quality", type=int, default=72,
-                        help="JPEG quality for frames [50..95]. Lower = less bandwidth/latency.")
-    parser.add_argument("--max-resize-width", type=int, default=800,
-                        help="Downscale width before sending to Ollama (<=1024 recommended on Jetson).")
-    parser.add_argument("--show", action="store_true", help="Show preview window with overlays.")
-    parser.add_argument("--speak", action="store_true", help="Speak captions via espeak-ng.")
-    parser.add_argument("--voice", type=str, default="en-us", help="espeak-ng voice.")
-    parser.add_argument("--wpm", type=int, default=165, help="espeak-ng words per minute.")
-    parser.add_argument("--gap", type=int, default=25, help="espeak-ng word gap (ms) for natural pacing.")
-    parser.add_argument("--pitch", type=int, default=48, help="espeak-ng pitch (0..99).")
-    parser.add_argument("--timeout", type=float, default=60.0, help="HTTP timeout seconds.")
-    # NEW: speak throttling and redundancy filtering
-    parser.add_argument("--min-speak-interval", type=float, default=4.0,
-                        help="Minimum seconds between spoken captions.")
-    parser.add_argument("--min-change", type=float, default=0.30,
-                        help="Only speak if similarity to last spoken < 1 - min-change. Range 0..1.")
-    parser.add_argument("--title", type=str, default="Ollama Vision Speaker", help="Window title.")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="Async, throttled Ollama vision speaker")
+    # Capture / pacing
+    ap.add_argument("--camera", type=int, default=0)
+    ap.add_argument("--width", type=int, default=640)
+    ap.add_argument("--height", type=int, default=480)
+    ap.add_argument("--fps", type=float, default=15.0, help="Lower FPS reduces power spikes.")
+    # Model request cadence
+    ap.add_argument("--describe", type=float, default=4.0, help="Seconds between caption requests.")
+    # Ollama
+    ap.add_argument("--ollama-url", type=str, default="http://127.0.0.1:11434")
+    ap.add_argument("--ollama-model", type=str, default="moondream")
+    ap.add_argument("--prompt", type=str, default="Describe the scene briefly.")
+    ap.add_argument("--system", type=str, default=None)
+    # Compression / resize
+    ap.add_argument("--jpeg-quality", type=int, default=68)
+    ap.add_argument("--max-resize-width", type=int, default=640)
+    # UI / TTS
+    ap.add_argument("--show", action="store_true")
+    ap.add_argument("--speak", action="store_true")
+    ap.add_argument("--voice", type=str, default="en-us")
+    ap.add_argument("--wpm", type=int, default=160)
+    ap.add_argument("--gap", type=int, default=30)
+    ap.add_argument("--pitch", type=int, default=48)
+    # Speak gating
+    ap.add_argument("--min-speak-interval", type=float, default=6.0,
+                    help="Minimum seconds between spoken captions.")
+    ap.add_argument("--min-change", type=float, default=0.40,
+                    help="Speak only if change ≥ this fraction (1 - similarity).")
+    # Misc
+    ap.add_argument("--title", type=str, default="Ollama Vision Speaker (Async)")
+    ap.add_argument("--timeout", type=float, default=60.0)
+    args = ap.parse_args()
 
+    # Camera
     cap = cv2.VideoCapture(args.camera, cv2.CAP_ANY)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(args.width))
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(args.height))
     cap.set(cv2.CAP_PROP_FPS, float(args.fps))
-
     if not cap.isOpened():
         raise RuntimeError(f"Camera {args.camera} failed to open.")
 
+    # Queues
+    frame_q: queue.Queue = queue.Queue(maxsize=1)
+    caption_q: queue.Queue = queue.Queue(maxsize=1)
+
+    # Clients / workers
     client = OllamaClient(args.ollama_url, args.ollama_model, timeout=args.timeout)
-    tts = TTSWorker(enabled=args.speak, wpm=args.wpm, voice=args.voice, gap_ms=args.gap, pitch=args.pitch)
+    cap_worker = CaptionWorker(client, args.prompt, args.system, frame_q, caption_q,
+                               describe_period=args.describe,
+                               max_resize_width=args.max_resize_width,
+                               jpeg_quality=args.jpeg_quality)
+    tts = TTSWorker(args.speak, args.wpm, args.voice, args.gap, args.pitch)
+    cap_worker.start()
     tts.start()
 
+    # State
     last_caption = ""
     last_spoken = ""
-    last_request_t = 0.0
     last_spoken_t = 0.0
-    describe_period = max(0.3, float(args.describe))
 
-    # Simple FPS meter for overlay
+    # HUD FPS
     fps_t0 = time.time()
-    fps_counter = 0
+    fps_n = 0
     live_fps = 0.0
 
     try:
@@ -298,61 +336,53 @@ def main():
                 time.sleep(0.01)
                 continue
 
-            fps_counter += 1
+            # Update HUD FPS
+            fps_n += 1
             now = time.time()
             if now - fps_t0 >= 1.0:
-                live_fps = fps_counter / (now - fps_t0)
+                live_fps = fps_n / (now - fps_t0)
                 fps_t0 = now
-                fps_counter = 0
+                fps_n = 0
 
-            # Request a new caption if interval elapsed
-            if (now - last_request_t) >= describe_period:
-                last_request_t = now
+            # Offer latest frame to worker (drop older)
+            try:
+                # If full, drop the pending older frame to keep only the newest
+                if frame_q.full():
+                    try:
+                        _ = frame_q.get_nowait()
+                    except queue.Empty:
+                        pass
+                frame_q.put_nowait(frame)
+            except queue.Full:
+                pass  # shouldn't happen due to drop logic
 
-                send_img = frame
-                max_w = int(max(320, args.max_resize_width))
-                if send_img.shape[1] > max_w:
-                    scale = max_w / send_img.shape[1]
-                    nh = int(send_img.shape[0] * scale)
-                    send_img = cv2.resize(send_img, (max_w, nh), interpolation=cv2.INTER_AREA)
+            # Pull newest caption if available
+            try:
+                while True:
+                    last_caption = caption_q.get_nowait()
+                    # drain to keep only the newest
+                    if caption_q.empty():
+                        break
+            except queue.Empty:
+                pass
 
-                try:
-                    b64 = bgr_to_jpeg_b64(send_img, quality=args.jpeg_quality)
-                    text = client.describe_image(
-                        img_b64_jpeg=b64,
-                        prompt=args.prompt,
-                        system=args.system,
-                        stream=False,
-                    )
-                    cleaned = " ".join(text.strip().split())
-                    if cleaned:
-                        last_caption = cleaned
-                        print(f"[{time.strftime('%H:%M:%S')}] {last_caption}")
+            # Speak with throttle + change gate
+            if args.speak and last_caption:
+                if (now - last_spoken_t) >= args.min_speak_interval:
+                    sim = similarity(last_spoken, last_caption)
+                    if (1.0 - sim) >= args.min_change:
+                        tts.say_replace(last_caption)
+                        last_spoken = last_caption
+                        last_spoken_t = time.time()
 
-                        # --- SPEAK DEBOUNCE / THROTTLE / REDUNDANCY FILTER ---
-                        if args.speak:
-                            # 1) Time gate
-                            if (now - last_spoken_t) >= args.min_speak_interval:
-                                # 2) Change gate (speak only if changed enough)
-                                sim = similarity(last_spoken, last_caption)
-                                changed_enough = (1.0 - sim) >= args.min_change
-                                if changed_enough:
-                                    tts.say_replace(last_caption)
-                                    last_spoken = last_caption
-                                    last_spoken_t = time.time()
-                except Exception as e:
-                    print(f"Ollama request error: {e}")
-
-            # Show preview with overlays if requested
+            # UI
             if args.show:
                 disp = frame.copy()
                 hud = f"{args.ollama_model} | {live_fps:.1f} FPS"
                 cv2.putText(disp, hud, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 3, cv2.LINE_AA)
                 cv2.putText(disp, hud, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1, cv2.LINE_AA)
-
                 if last_caption:
-                    disp = overlay_caption(disp, last_caption, max_width_frac=0.96)
-
+                    disp = overlay_caption(disp, last_caption, 0.96)
                 cv2.imshow(args.title, disp)
                 key = cv2.waitKey(1) & 0xFF
                 if key in (27, ord('q')):
@@ -370,6 +400,7 @@ def main():
                 cv2.destroyAllWindows()
             except Exception:
                 pass
+        cap_worker.stop()
         tts.stop()
 
 
