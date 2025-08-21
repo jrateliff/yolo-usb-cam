@@ -13,7 +13,7 @@
 # From Terminal:
 #   cd ~/yolo-usb-cam
 #   git add ollama_vision_speaker_async.py
-#   git commit -m "Async captioner: overlay-only (no terminal output), no power-mode changes"
+#   git commit -m "Async captioner: natural SSML speech, pause tuning, overlay-only"
 #   git push
 #
 # Notes:
@@ -22,12 +22,12 @@
 # =============================================================================
 """
 ollama_vision_speaker_async.py
-Async, low-chatter, overlay-only captioner:
+Async, low-chatter, overlay-only captioner with more natural speech:
   • Camera loop never blocks on network or TTS.
-  • Background worker uses only the latest frame (no backlog).
-  • Speak throttle + redundancy filter (skip near-duplicates).
+  • Background worker always uses the latest frame (no backlog).
+  • Speak throttle + similarity gate (skip near-duplicates).
   • Overlay text onto the preview window; NO terminal prints by default.
-  • Program does NOT change Jetson power mode (no nvpmodel calls).
+  • Program does NOT change Jetson power mode.
 
 Prereqs:
   pip install "numpy<2" "opencv-python-headless<4.9" requests
@@ -38,11 +38,12 @@ import argparse
 import base64
 import difflib
 import queue
+import re
 import subprocess
 import textwrap
 import threading
 import time
-from typing import Optional
+from typing import Optional, List
 
 import cv2
 import numpy as np
@@ -101,16 +102,117 @@ def overlay_caption(frame: np.ndarray, caption: str, max_width_frac: float = 0.9
     return frame
 
 
-def speak_espeak(text: str, wpm: int = 160, voice: str = "en-us", gap_ms: int = 30, pitch: int = 48) -> None:
+def _clean_text_for_tts(text: str) -> str:
+    """
+    Gentle cleanup so TTS sounds less robotic:
+      • Remove URLs.
+      • Collapse whitespace/punctuation.
+      • Ensure sentence-final punctuation exists.
+      • Expand a few common symbols.
+    """
+    t = text.strip()
+
+    # Remove URLs (they sound terrible)
+    t = re.sub(r'https?://\S+', '', t)
+
+    # Replace some symbols
+    t = t.replace('&', ' and ').replace('/', ' / ')
+    t = re.sub(r'\s+', ' ', t)
+
+    # Ensure punctuation at end
+    if t and t[-1] not in '.!?':
+        t = t + '.'
+
+    # Avoid triple punctuation
+    t = re.sub(r'([.!?,]){2,}', r'\1', t)
+
+    return t.strip()
+
+
+def _split_sentences(text: str) -> List[str]:
+    """Lightweight sentence splitter."""
+    # Split on ., !, ? followed by space/cap/number
+    parts = re.split(r'(?<=[.!?])\s+(?=[A-Z0-9])', text)
+    # Fallback if nothing split
+    if len(parts) == 1:
+        # Try commas
+        parts = [p.strip() for p in re.split(r'\s*,\s*', text) if p.strip()]
+    else:
+        parts = [p.strip() for p in parts if p.strip()]
+    return parts
+
+
+def _to_ssml(text: str, comma_pause_ms: int, sentence_pause_ms: int) -> str:
+    """
+    Convert plain text into simple SSML for more natural pacing.
+    Adds short breaks after commas and longer breaks between sentences.
+    """
+    t = _clean_text_for_tts(text)
+    sents = _split_sentences(t)
+
+    ssml_sents = []
+    for s in sents:
+        # Insert small pauses at commas
+        s = re.sub(r'\s*,\s*', f', <break time="{int(comma_pause_ms)}ms"/> ', s)
+        ssml_sents.append(f'<s>{s}</s>')
+
+    # Pause between sentences
+    joiner = f'\n<break time="{int(sentence_pause_ms)}ms"/>\n'
+    body = joiner.join(ssml_sents)
+    return f'<speak version="1.0">{body}</speak>'
+
+
+def speak_espeak(
+    text: str,
+    wpm: int = 150,
+    voice: str = "en-us",
+    gap_ms: int = 30,
+    pitch: int = 48,
+    amp: int = 160,
+    use_ssml: bool = True,
+    comma_pause_ms: int = 140,
+    sentence_pause_ms: int = 260,
+) -> None:
+    """
+    Speak using espeak-ng. When SSML is enabled, we wrap the text with <speak>
+    and inject <break> tags to add natural pauses.
+    """
     if not text:
         return
     try:
-        subprocess.run(
-            ["espeak-ng", "-s", str(int(wpm)), "-v", voice, "-g", str(int(gap_ms)), "-p", str(int(pitch)), text],
-            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
+        if use_ssml:
+            ssml = _to_ssml(text, comma_pause_ms, sentence_pause_ms)
+            # -m to enable SSML parsing; pass text as a single arg
+            subprocess.run(
+                [
+                    "espeak-ng",
+                    "-m",
+                    "-s", str(int(wpm)),
+                    "-v", voice,
+                    "-g", str(int(gap_ms)),
+                    "-p", str(int(pitch)),
+                    "-a", str(int(np.clip(amp, 0, 200))),
+                    ssml,
+                ],
+                check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+        else:
+            # Plain mode
+            cleaned = _clean_text_for_tts(text)
+            subprocess.run(
+                [
+                    "espeak-ng",
+                    "-s", str(int(wpm)),
+                    "-v", voice,
+                    "-g", str(int(gap_ms)),
+                    "-p", str(int(pitch)),
+                    "-a", str(int(np.clip(amp, 0, 200))),
+                    cleaned,
+                ],
+                check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
     except FileNotFoundError:
-        # Stay silent in terminal
+        # Silent failure by design
         pass
 
 
@@ -191,7 +293,6 @@ class CaptionWorker(threading.Thread):
 
     def _log(self, msg: str):
         if self.enable_log:
-            # Optional: minimal logging if --log is passed
             try:
                 print(msg)
             except Exception:
@@ -244,13 +345,18 @@ class CaptionWorker(threading.Thread):
 
 class TTSWorker(threading.Thread):
     """Single-slot queue; latest utterance replaces older to avoid overlap/backlog."""
-    def __init__(self, enabled: bool, wpm: int, voice: str, gap_ms: int, pitch: int):
+    def __init__(self, enabled: bool, wpm: int, voice: str, gap_ms: int, pitch: int,
+                 amp: int, ssml: bool, comma_pause_ms: int, sentence_pause_ms: int):
         super().__init__(daemon=True)
         self.enabled = enabled
         self.wpm = wpm
         self.voice = voice
         self.gap_ms = gap_ms
         self.pitch = pitch
+        self.amp = amp
+        self.ssml = ssml
+        self.comma_pause_ms = comma_pause_ms
+        self.sentence_pause_ms = sentence_pause_ms
         self.q = queue.Queue(maxsize=1)
         self._stop = threading.Event()
 
@@ -277,40 +383,63 @@ class TTSWorker(threading.Thread):
             except queue.Empty:
                 continue
             if self.enabled:
-                speak_espeak(text, self.wpm, self.voice, self.gap_ms, self.pitch)
+                speak_espeak(
+                    text,
+                    wpm=self.wpm,
+                    voice=self.voice,
+                    gap_ms=self.gap_ms,
+                    pitch=self.pitch,
+                    amp=self.amp,
+                    use_ssml=self.ssml,
+                    comma_pause_ms=self.comma_pause_ms,
+                    sentence_pause_ms=self.sentence_pause_ms,
+                )
 
 
 # --------------------------- Main ---------------------------
 
 def main():
     ap = argparse.ArgumentParser(description="Async, throttled Ollama vision speaker (overlay-only)")
+
     # Capture / pacing
     ap.add_argument("--camera", type=int, default=0)
     ap.add_argument("--width", type=int, default=640)
     ap.add_argument("--height", type=int, default=480)
     ap.add_argument("--fps", type=float, default=15.0, help="Lower FPS reduces power spikes.")
+
     # Model request cadence
     ap.add_argument("--describe", type=float, default=4.0, help="Seconds between caption requests.")
+
     # Ollama
     ap.add_argument("--ollama-url", type=str, default="http://127.0.0.1:11434")
     ap.add_argument("--ollama-model", type=str, default="moondream")
     ap.add_argument("--prompt", type=str, default="Describe the scene briefly.")
     ap.add_argument("--system", type=str, default=None)
+
     # Compression / resize
     ap.add_argument("--jpeg-quality", type=int, default=68)
     ap.add_argument("--max-resize-width", type=int, default=640)
+
     # UI / TTS
     ap.add_argument("--show", action="store_true")
     ap.add_argument("--speak", action="store_true")
+
+    # TTS voice shaping (tuned for naturalness)
     ap.add_argument("--voice", type=str, default="en-us")
-    ap.add_argument("--wpm", type=int, default=160)
-    ap.add_argument("--gap", type=int, default=30)
-    ap.add_argument("--pitch", type=int, default=48)
+    ap.add_argument("--wpm", type=int, default=150, help="Speaking rate (words per minute).")
+    ap.add_argument("--gap", type=int, default=25, help="Inter-word gap in ms (espeak-ng -g).")
+    ap.add_argument("--pitch", type=int, default=50, help="Voice pitch (0-99).")
+    ap.add_argument("--amp", type=int, default=160, help="Amplitude/volume (0-200).")
+    ap.add_argument("--no-ssml", action="store_true", help="Disable SSML pacing and speak plain text.")
+    ap.add_argument("--comma-pause", type=int, default=140, help="Pause at commas (ms) when SSML is on.")
+    ap.add_argument("--sentence-pause", type=int, default=260, help="Pause between sentences (ms) with SSML.")
+
     # Speak gating
     ap.add_argument("--min-speak-interval", type=float, default=6.0,
                     help="Minimum seconds between spoken captions.")
     ap.add_argument("--min-change", type=float, default=0.40,
                     help="Speak only if change ≥ this fraction (1 - similarity).")
+
     # Misc
     ap.add_argument("--title", type=str, default="Ollama Vision Speaker (Async)")
     ap.add_argument("--timeout", type=float, default=60.0)
@@ -332,12 +461,24 @@ def main():
 
     # Clients / workers
     client = OllamaClient(args.ollama_url, args.ollama_model, timeout=args.timeout)
-    cap_worker = CaptionWorker(client, args.prompt, args.system, frame_q, caption_q,
-                               describe_period=args.describe,
-                               max_resize_width=args.max_resize_width,
-                               jpeg_quality=args.jpeg_quality,
-                               enable_log=args.log)
-    tts = TTSWorker(args.speak, args.wpm, args.voice, args.gap, args.pitch)
+    cap_worker = CaptionWorker(
+        client, args.prompt, args.system, frame_q, caption_q,
+        describe_period=args.describe,
+        max_resize_width=args.max_resize_width,
+        jpeg_quality=args.jpeg_quality,
+        enable_log=args.log
+    )
+    tts = TTSWorker(
+        enabled=args.speak,
+        wpm=args.wpm,
+        voice=args.voice,
+        gap_ms=args.gap,
+        pitch=args.pitch,
+        amp=args.amp,
+        ssml=(not args.no-ssml),
+        comma_pause_ms=args.comma_pause,
+        sentence_pause_ms=args.sentence_pause
+    )
     cap_worker.start()
     tts.start()
 
