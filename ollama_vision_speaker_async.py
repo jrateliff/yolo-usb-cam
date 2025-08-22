@@ -13,7 +13,7 @@
 # From Terminal:
 #   cd ~/yolo-usb-cam
 #   git add ollama_vision_speaker_async.py
-#   git commit -m "Async captioner: natural SSML speech, pause tuning, overlay-only"
+#   git commit -m "TTS smoother: smart preempt + no-preempt window; default no-SSML, small word gap; hard-kill on exit"
 #   git push
 #
 # Notes:
@@ -22,42 +22,104 @@
 # =============================================================================
 """
 ollama_vision_speaker_async.py
-Async, low-chatter, overlay-only captioner with more natural speech:
+
+Async, overlay-only captioner with *smooth* speech:
   • Camera loop never blocks on network or TTS.
-  • Background worker always uses the latest frame (no backlog).
   • Speak throttle + similarity gate (skip near-duplicates).
-  • Overlay text onto the preview window; NO terminal prints by default.
+  • TTS is preemptible but *politely*: smart preemption avoids mid-word chopping.
+  • No-SSML by default (cleaner pacing); smaller inter-word gap.
+  • TTS processes are tracked and killed instantly on exit/signals.
+  • Optional FOURCC lock to MJPG for Logitech webcams.
   • Program does NOT change Jetson power mode.
 
 Prereqs:
   pip install "numpy<2" "opencv-python-headless<4.9" requests
-  sudo apt install espeak-ng
+  sudo apt install espeak-ng alsa-utils
 """
 
 import argparse
+import atexit
 import base64
 import difflib
+import os
 import queue
 import re
+import shutil
+import signal
 import subprocess
 import textwrap
 import threading
 import time
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 import cv2
 import numpy as np
 import requests
 
 
+# --------------------------- Child process management (TTS) ---------------------------
+
+class _ProcMgr:
+    """Track child PIDs and kill them all on demand."""
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._procs = set()
+
+    def track(self, p: subprocess.Popen):
+        with self._lock:
+            self._procs.add(p)
+
+    def untrack(self, p: subprocess.Popen):
+        with self._lock:
+            self._procs.discard(p)
+
+    def kill_all(self, sig=signal.SIGTERM, wait_s: float = 0.25):
+        with self._lock:
+            procs = list(self._procs)
+            self._procs.clear()
+        for p in procs:
+            try:
+                try:
+                    os.killpg(p.pid, sig)  # whole group
+                except Exception:
+                    p.terminate()
+                try:
+                    p.wait(timeout=wait_s)
+                except Exception:
+                    try:
+                        os.killpg(p.pid, signal.SIGKILL)
+                    except Exception:
+                        p.kill()
+            except Exception:
+                pass
+
+PROC_MGR = _ProcMgr()
+
+def _install_signal_handlers():
+    def _cleanup_and_exit(signum, _frame):
+        try:
+            PROC_MGR.kill_all()
+        finally:
+            try:
+                cv2.destroyAllWindows()
+            except Exception:
+                pass
+            os._exit(0)  # ensure no lingering audio
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(sig, _cleanup_and_exit)
+        except Exception:
+            pass
+
+atexit.register(lambda: PROC_MGR.kill_all())
+
+
 # --------------------------- Utils ---------------------------
 
 def bgr_to_jpeg_b64(img_bgr: np.ndarray, quality: int = 68) -> str:
-    """Encode BGR frame to base64 JPEG string (no data URI)."""
     encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), int(np.clip(quality, 50, 95))]
     ok, buf = cv2.imencode(".jpg", img_bgr, encode_params)
     if not ok:
-        # No prints: fail silently by returning empty payload
         return ""
     return base64.b64encode(buf.tobytes()).decode("ascii")
 
@@ -103,121 +165,204 @@ def overlay_caption(frame: np.ndarray, caption: str, max_width_frac: float = 0.9
 
 
 def _clean_text_for_tts(text: str) -> str:
-    """
-    Gentle cleanup so TTS sounds less robotic:
-      • Remove URLs.
-      • Collapse whitespace/punctuation.
-      • Ensure sentence-final punctuation exists.
-      • Expand a few common symbols.
-    """
     t = text.strip()
-
-    # Remove URLs (they sound terrible)
-    t = re.sub(r'https?://\S+', '', t)
-
-    # Replace some symbols
+    t = re.sub(r'https?://\S+', '', t)  # URLs sound awful
     t = t.replace('&', ' and ').replace('/', ' / ')
     t = re.sub(r'\s+', ' ', t)
-
-    # Ensure punctuation at end
     if t and t[-1] not in '.!?':
         t = t + '.'
-
-    # Avoid triple punctuation
     t = re.sub(r'([.!?,]){2,}', r'\1', t)
-
     return t.strip()
 
 
-def _split_sentences(text: str) -> List[str]:
-    """Lightweight sentence splitter."""
-    # Split on ., !, ? followed by space/cap/number
-    parts = re.split(r'(?<=[.!?])\s+(?=[A-Z0-9])', text)
-    # Fallback if nothing split
-    if len(parts) == 1:
-        # Try commas
-        parts = [p.strip() for p in re.split(r'\s*,\s*', text) if p.strip()]
+def _has_exec(name: str) -> bool:
+    return shutil.which(name) is not None
+
+
+# --------------------------- TTS (smooth + smart preemption) ---------------------------
+
+def build_tts_command_espeak(text: str, wpm: int, voice: str, gap_ms: int, pitch: int, amp: int,
+                             use_ssml: bool, comma_pause_ms: int, sentence_pause_ms: int) -> List[str]:
+    cleaned = _clean_text_for_tts(text)
+    if use_ssml:
+        # Lightweight SSML: smaller breaks to avoid choppiness
+        def to_ssml(s: str) -> str:
+            s = re.sub(r'\s*,\s*', f', <break time="{int(comma_pause_ms)}ms"/> ', s)
+            return f'<s>{s}</s>'
+        sents = re.split(r'(?<=[.!?])\s+(?=[A-Z0-9])', cleaned) or [cleaned]
+        sents = [s.strip() for s in sents if s.strip()]
+        body = f'\n<break time="{int(sentence_pause_ms)}ms"/>\n'.join(to_ssml(s) for s in sents)
+        ssml = f'<speak version="1.0">{body}</speak>'
+        return ["espeak-ng", "-m",
+                "-s", str(int(wpm)), "-v", voice,
+                "-g", str(int(gap_ms)), "-p", str(int(pitch)),
+                "-a", str(int(np.clip(amp, 0, 200))),
+                ssml]
     else:
-        parts = [p.strip() for p in parts if p.strip()]
-    return parts
+        return ["espeak-ng",
+                "-s", str(int(wpm)), "-v", voice,
+                "-g", str(int(gap_ms)), "-p", str(int(pitch)),
+                "-a", str(int(np.clip(amp, 0, 200))),
+                cleaned]
 
 
-def _to_ssml(text: str, comma_pause_ms: int, sentence_pause_ms: int) -> str:
+class TTSWorker(threading.Thread):
     """
-    Convert plain text into simple SSML for more natural pacing.
-    Adds short breaks after commas and longer breaks between sentences.
+    Smooth, preemptible TTS.
+    - 'preempt=smart': do NOT interrupt for small changes; allow a brief no-preempt window at start.
+    - 'preempt=immediate': cut current audio as soon as a new caption arrives.
+    - 'preempt=never': never cut; only play latest after current finishes.
     """
-    t = _clean_text_for_tts(text)
-    sents = _split_sentences(t)
+    def __init__(self, enabled: bool, wpm: int, voice: str, gap_ms: int, pitch: int,
+                 amp: int, use_ssml: bool, comma_pause_ms: int, sentence_pause_ms: int,
+                 audio_out: str, alsa_device: Optional[str],
+                 preempt_mode: str, no_preempt_window: float, preempt_change: float):
+        super().__init__(daemon=True)
+        self.enabled = enabled
+        self.wpm = wpm
+        self.voice = voice
+        self.gap_ms = gap_ms
+        self.pitch = pitch
+        self.amp = amp
+        self.use_ssml = use_ssml
+        self.comma_pause_ms = comma_pause_ms
+        self.sentence_pause_ms = sentence_pause_ms
+        self.audio_out = audio_out
+        self.alsa_device = alsa_device
+        self.preempt_mode = preempt_mode
+        self.no_preempt_window = max(0.0, float(no_preempt_window))
+        self.preempt_change = float(np.clip(preempt_change, 0.0, 1.0))  # fraction change needed to cut
+        self.q = queue.Queue(maxsize=1)
+        self._stop = threading.Event()
+        self._current_proc: Optional[subprocess.Popen] = None
+        self._speak_started_t: float = 0.0
+        self._current_text: str = ""
 
-    ssml_sents = []
-    for s in sents:
-        # Insert small pauses at commas
-        s = re.sub(r'\s*,\s*', f', <break time="{int(comma_pause_ms)}ms"/> ', s)
-        ssml_sents.append(f'<s>{s}</s>')
+    def stop(self):
+        self._stop.set()
+        PROC_MGR.kill_all()
 
-    # Pause between sentences
-    joiner = f'\n<break time="{int(sentence_pause_ms)}ms"/>\n'
-    body = joiner.join(ssml_sents)
-    return f'<speak version="1.0">{body}</speak>'
+    def say_replace(self, text: str):
+        if not text:
+            return
+        # overwrite mailbox with latest text; do NOT kill here (preemption decided in run-loop)
+        while True:
+            try:
+                self.q.put_nowait(text)
+                break
+            except queue.Full:
+                try:
+                    _ = self.q.get_nowait()
+                except queue.Empty:
+                    pass
 
+    def _start_proc(self, cmd: List[str]) -> subprocess.Popen:
+        p = subprocess.Popen(cmd, preexec_fn=os.setsid, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        PROC_MGR.track(p)
+        self._current_proc = p
+        self._speak_started_t = time.monotonic()
+        return p
 
-def speak_espeak(
-    text: str,
-    wpm: int = 150,
-    voice: str = "en-us",
-    gap_ms: int = 30,
-    pitch: int = 48,
-    amp: int = 160,
-    use_ssml: bool = True,
-    comma_pause_ms: int = 140,
-    sentence_pause_ms: int = 260,
-) -> None:
-    """
-    Speak using espeak-ng. When SSML is enabled, we wrap the text with <speak>
-    and inject <break> tags to add natural pauses.
-    """
-    if not text:
-        return
-    try:
-        if use_ssml:
-            ssml = _to_ssml(text, comma_pause_ms, sentence_pause_ms)
-            # -m to enable SSML parsing; pass text as a single arg
-            subprocess.run(
-                [
-                    "espeak-ng",
-                    "-m",
-                    "-s", str(int(wpm)),
-                    "-v", voice,
-                    "-g", str(int(gap_ms)),
-                    "-p", str(int(pitch)),
-                    "-a", str(int(np.clip(amp, 0, 200))),
-                    ssml,
-                ],
-                check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-        else:
-            # Plain mode
-            cleaned = _clean_text_for_tts(text)
-            subprocess.run(
-                [
-                    "espeak-ng",
-                    "-s", str(int(wpm)),
-                    "-v", voice,
-                    "-g", str(int(gap_ms)),
-                    "-p", str(int(pitch)),
-                    "-a", str(int(np.clip(amp, 0, 200))),
-                    cleaned,
-                ],
-                check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-    except FileNotFoundError:
-        # Silent failure by design
-        pass
+    def _finish_proc(self):
+        p = self._current_proc
+        self._current_proc = None
+        if p is not None:
+            try:
+                PROC_MGR.untrack(p)
+            except Exception:
+                pass
 
+    def _kill_current(self):
+        p = self._current_proc
+        if p is None:
+            return
+        try:
+            try:
+                os.killpg(p.pid, signal.SIGTERM)
+            except Exception:
+                p.terminate()
+            try:
+                p.wait(timeout=0.15)
+            except Exception:
+                try:
+                    os.killpg(p.pid, signal.SIGKILL)
+                except Exception:
+                    p.kill()
+        except Exception:
+            pass
+        finally:
+            self._finish_proc()
 
-def similarity(a: str, b: str) -> float:
-    return difflib.SequenceMatcher(None, a.strip(), b.strip()).ratio() if a and b else 0.0
+    def _should_preempt(self, new_text: str) -> bool:
+        if self.preempt_mode == "never":
+            return False
+        if self.preempt_mode == "immediate":
+            # allow tiny safety window to avoid frantic cut-start loops
+            return (time.monotonic() - self._speak_started_t) >= max(0.05, self.no_preempt_window)
+
+        # smart mode
+        if (time.monotonic() - self._speak_started_t) < self.no_preempt_window:
+            return False
+        sim = difflib.SequenceMatcher(None, (self._current_text or "").strip(), new_text.strip()).ratio()
+        change = 1.0 - sim
+        return change >= self.preempt_change  # only cut if substantially different
+
+    def run(self):
+        while not self._stop.is_set():
+            # If nothing speaking, block a bit for next text
+            if self._current_proc is None:
+                try:
+                    self._current_text = self.q.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                if not self.enabled or not _has_exec("espeak-ng"):
+                    # drain until disabled/enabled flips
+                    self._current_text = ""
+                    continue
+                cmd = build_tts_command_espeak(
+                    self._current_text, self.wpm, self.voice, self.gap_ms, self.pitch, self.amp,
+                    self.use_ssml, self.comma_pause_ms, self.sentence_pause_ms
+                )
+                self._start_proc(cmd)
+
+            # While speaking, check for updates or process completion
+            if self._current_proc is not None:
+                # Collect the latest pending text if any (overwrite mailbox)
+                pending_latest: Optional[str] = None
+                try:
+                    while True:
+                        pending_latest = self.q.get_nowait()
+                except queue.Empty:
+                    pass
+
+                if self._current_proc.poll() is not None:
+                    # finished naturally
+                    self._finish_proc()
+                    self._current_text = ""
+                    # If we had pending text, loop will pick it up and speak next
+                    continue
+
+                if pending_latest:
+                    # Decide whether to preempt
+                    if self._should_preempt(pending_latest):
+                        self._kill_current()
+                        self._current_text = pending_latest
+                        if self.enabled and _has_exec("espeak-ng"):
+                            cmd = build_tts_command_espeak(
+                                self._current_text, self.wpm, self.voice, self.gap_ms, self.pitch, self.amp,
+                                self.use_ssml, self.comma_pause_ms, self.sentence_pause_ms
+                            )
+                            self._start_proc(cmd)
+                    else:
+                        # Don't cut; keep latest to say after finish
+                        try:
+                            self.q.queue.clear()
+                            self.q.put_nowait(pending_latest)
+                        except Exception:
+                            pass
+
+                # brief sleep to avoid busy-waiting
+                time.sleep(0.03)
 
 
 # --------------------------- Ollama client ---------------------------
@@ -262,7 +407,7 @@ class OllamaClient:
                 return resp.strip()
         except Exception:
             pass
-        return ""  # No terminal prints
+        return ""
 
 
 # --------------------------- Workers ---------------------------
@@ -286,7 +431,7 @@ class CaptionWorker(threading.Thread):
         self.max_resize_width = int(max(320, max_resize_width))
         self.jpeg_quality = int(np.clip(jpeg_quality, 50, 95))
         self._stop = threading.Event()
-        self.enable_log = enable_log  # if True, will print minimal logs
+        self.enable_log = enable_log
 
     def stop(self):
         self._stop.set()
@@ -307,7 +452,6 @@ class CaptionWorker(threading.Thread):
                 continue
             next_time = now + self.describe_period
 
-            # Always use the *latest* frame (drop older)
             frame = None
             try:
                 while True:
@@ -326,7 +470,6 @@ class CaptionWorker(threading.Thread):
                 text = self.client.describe_image(b64, self.prompt, self.system)
                 cleaned = " ".join(text.strip().split())
                 if cleaned:
-                    # Replace any pending caption with the newest
                     put_ok = False
                     while not put_ok:
                         try:
@@ -339,66 +482,14 @@ class CaptionWorker(threading.Thread):
                                 pass
                     self._log(f"[{time.strftime('%H:%M:%S')}] {cleaned}")
             except Exception:
-                # Silent by default
                 pass
-
-
-class TTSWorker(threading.Thread):
-    """Single-slot queue; latest utterance replaces older to avoid overlap/backlog."""
-    def __init__(self, enabled: bool, wpm: int, voice: str, gap_ms: int, pitch: int,
-                 amp: int, ssml: bool, comma_pause_ms: int, sentence_pause_ms: int):
-        super().__init__(daemon=True)
-        self.enabled = enabled
-        self.wpm = wpm
-        self.voice = voice
-        self.gap_ms = gap_ms
-        self.pitch = pitch
-        self.amp = amp
-        self.ssml = ssml
-        self.comma_pause_ms = comma_pause_ms
-        self.sentence_pause_ms = sentence_pause_ms
-        self.q = queue.Queue(maxsize=1)
-        self._stop = threading.Event()
-
-    def stop(self):
-        self._stop.set()
-
-    def say_replace(self, text: str):
-        if not text:
-            return
-        while True:
-            try:
-                self.q.put_nowait(text)
-                break
-            except queue.Full:
-                try:
-                    _ = self.q.get_nowait()
-                except queue.Empty:
-                    pass
-
-    def run(self):
-        while not self._stop.is_set():
-            try:
-                text = self.q.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            if self.enabled:
-                speak_espeak(
-                    text,
-                    wpm=self.wpm,
-                    voice=self.voice,
-                    gap_ms=self.gap_ms,
-                    pitch=self.pitch,
-                    amp=self.amp,
-                    use_ssml=self.ssml,
-                    comma_pause_ms=self.comma_pause_ms,
-                    sentence_pause_ms=self.sentence_pause_ms,
-                )
 
 
 # --------------------------- Main ---------------------------
 
 def main():
+    _install_signal_handlers()
+
     ap = argparse.ArgumentParser(description="Async, throttled Ollama vision speaker (overlay-only)")
 
     # Capture / pacing
@@ -406,6 +497,8 @@ def main():
     ap.add_argument("--width", type=int, default=640)
     ap.add_argument("--height", type=int, default=480)
     ap.add_argument("--fps", type=float, default=15.0, help="Lower FPS reduces power spikes.")
+    ap.add_argument("--fourcc", type=str, default="MJPG",
+                    help='FOURCC for camera. "MJPG" is good for Logitech. Use "raw" to skip.')
 
     # Model request cadence
     ap.add_argument("--describe", type=float, default=4.0, help="Seconds between caption requests.")
@@ -424,20 +517,34 @@ def main():
     ap.add_argument("--show", action="store_true")
     ap.add_argument("--speak", action="store_true")
 
-    # TTS voice shaping (tuned for naturalness)
+    # TTS shaping (defaults chosen for smoothness)
     ap.add_argument("--voice", type=str, default="en-us")
-    ap.add_argument("--wpm", type=int, default=150, help="Speaking rate (words per minute).")
-    ap.add_argument("--gap", type=int, default=25, help="Inter-word gap in ms (espeak-ng -g).")
-    ap.add_argument("--pitch", type=int, default=50, help="Voice pitch (0-99).")
-    ap.add_argument("--amp", type=int, default=160, help="Amplitude/volume (0-200).")
-    ap.add_argument("--no-ssml", action="store_true", help="Disable SSML pacing and speak plain text.")
-    ap.add_argument("--comma-pause", type=int, default=140, help="Pause at commas (ms) when SSML is on.")
-    ap.add_argument("--sentence-pause", type=int, default=260, help="Pause between sentences (ms) with SSML.")
+    ap.add_argument("--wpm", type=int, default=150)
+    ap.add_argument("--gap", type=int, default=8, help="Inter-word gap in ms (smaller = smoother).")
+    ap.add_argument("--pitch", type=int, default=50)
+    ap.add_argument("--amp", type=int, default=170)
+    ap.add_argument("--no-ssml", action="store_true", help="Disable SSML pacing; speak plain text.")
+    ap.add_argument("--comma-pause", type=int, default=80)
+    ap.add_argument("--sentence-pause", type=int, default=160)
+
+    # Output backend controls (keep default = direct espeak for smoothness)
+    ap.add_argument("--audio-out", type=str, choices=["auto", "espeak", "aplay", "paplay"], default="auto",
+                    help="Force a specific audio path or let it auto-select.")
+    ap.add_argument("--alsa-device", type=str, default=None,
+                    help="ALSA device for aplay, e.g., hw:0,0")
+
+    # Preemption policy
+    ap.add_argument("--preempt", type=str, choices=["smart", "immediate", "never"], default="smart",
+                    help="How aggressively to cut current speech for new text.")
+    ap.add_argument("--no-preempt-window", type=float, default=1.0,
+                    help="Seconds after speech start where cuts are disallowed in smart/immediate modes.")
+    ap.add_argument("--preempt-change", type=float, default=0.70,
+                    help="Fractional change (1-similarity) needed to cut speech in smart mode.")
 
     # Speak gating
     ap.add_argument("--min-speak-interval", type=float, default=6.0,
                     help="Minimum seconds between spoken captions.")
-    ap.add_argument("--min-change", type=float, default=0.40,
+    ap.add_argument("--min-change", type=float, default=0.45,
                     help="Speak only if change ≥ this fraction (1 - similarity).")
 
     # Misc
@@ -448,11 +555,19 @@ def main():
 
     # Camera
     cap = cv2.VideoCapture(args.camera, cv2.CAP_ANY)
+
+    # Optional FOURCC lock (helps Logitech webcams behave)
+    if args.fourcc and args.fourcc.upper() != "RAW":
+        try:
+            four = cv2.VideoWriter_fourcc(*args.fourcc.upper())
+            cap.set(cv2.CAP_PROP_FOURCC, four)
+        except Exception:
+            pass
+
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(args.width))
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(args.height))
     cap.set(cv2.CAP_PROP_FPS, float(args.fps))
     if not cap.isOpened():
-        # No prints: raise to exit quietly; caller sees no logs
         raise RuntimeError(f"Camera {args.camera} failed to open.")
 
     # Queues
@@ -475,9 +590,14 @@ def main():
         gap_ms=args.gap,
         pitch=args.pitch,
         amp=args.amp,
-        ssml=(not args.no-ssml),
+        use_ssml=(not args.no_ssml),
         comma_pause_ms=args.comma_pause,
-        sentence_pause_ms=args.sentence_pause
+        sentence_pause_ms=args.sentence_pause,
+        audio_out=args.audio_out,
+        alsa_device=args.alsa_device,
+        preempt_mode=args.preempt,
+        no_preempt_window=args.no_preempt_window,
+        preempt_change=args.preempt_change
     )
     cap_worker.start()
     tts.start()
@@ -530,7 +650,7 @@ def main():
             # Speak with throttle + change gate
             if args.speak and last_caption:
                 if (now - last_spoken_t) >= args.min_speak_interval:
-                    sim = similarity(last_spoken, last_caption)
+                    sim = difflib.SequenceMatcher(None, last_spoken.strip(), last_caption.strip()).ratio() if last_spoken else 0.0
                     if (1.0 - sim) >= args.min_change:
                         tts.say_replace(last_caption)
                         last_spoken = last_caption
@@ -563,6 +683,7 @@ def main():
                 pass
         cap_worker.stop()
         tts.stop()
+        PROC_MGR.kill_all()
 
 
 if __name__ == "__main__":
